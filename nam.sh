@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# nam.sh V1.0.0
+# nam.sh V1.1.0
 #
 # Copyright (c) 2019 NetCon Unternehmensberatung GmbH, netcon-consulting.com
 #
@@ -11,7 +11,7 @@ if ! [ -f "$SSH_CONFIG" ]; then
     echo "SSH config '$SSH_CONFIG' does not exist"
     exit 1
 fi
-DIR_ANSIBLE="$HOME/Nextcloud/ansible"
+DIR_ANSIBLE="$(dirname $0)"
 if ! [ -d "$DIR_ANSIBLE" ]; then
     echo "Ansible directory '$DIR_ANSIBLE' does not exist"
     exit 2
@@ -41,11 +41,15 @@ if ! [ -f "$FILE_CONFIG" ]; then
     echo "Ansible config '$FILE_CONFIG' does not exist"
     exit 6
 fi
-ANSIBLE_INVENTORY="$(grep '^inventory=' $FILE_CONFIG | $CMD_AWK -F= '{print $2}')"
+ANSIBLE_INVENTORY="$(grep '^inventory\s*=' $FILE_CONFIG | $CMD_AWK -F= '{print $2}' | $CMD_SED 's/ //g')"
 if [ -z "$ANSIBLE_INVENTORY" ]; then
     echo "Ansible inventory not defined in Ansible config '$FILE_CONFIG'"
     exit 7
 fi
+FILE_PASSWORD="$(grep '^vault_password_file\s*=' $FILE_CONFIG | $CMD_AWK -F= '{print $2}' | $CMD_SED 's/ //g')"
+[ -z "$FILE_PASSWORD" ] || FILE_PASSWORD="$DIR_ANSIBLE/$FILE_PASSWORD"
+DIR_VAULT="$DIR_ANSIBLE/group_vars/all"
+FILE_VAULT="$DIR_VAULT/vault.yml"
 DIR_INVENTORY="$DIR_ANSIBLE/$ANSIBLE_INVENTORY"
 if ! [ -d "$DIR_INVENTORY" ]; then
     echo "Ansible inventory directory '$DIR_INVENTORY' does not exist"
@@ -470,8 +474,8 @@ server_ping() {
 # return values:
 # list of tags
 get_tags() {
-    LIST_TAG="$(grep 'tags:' $FILE_PLAYBOOK | awk -F '[\\[\\]]' '{print $2}' | awk -F, '{for (i=1;i<=NF;i++) print $i}')"
-    LIST_TAG+="$(grep -r '^\s*tags: ' $DIR_ROLES | awk -F 'tags: ' '{print $2}')"
+    LIST_TAG="$(grep 'tags:' $FILE_PLAYBOOK | $CMD_AWK -F '[\\[\\]]' '{print $2}' | $CMD_AWK -F, '{for (i=1;i<=NF;i++) print $i}')"
+    LIST_TAG+="$(grep -r '^\s*tags: ' $DIR_ROLES | $CMD_AWK -F 'tags: ' '{print $2}')"
     echo $LIST_TAG | xargs -n 1 | sort -u
 }
 
@@ -503,7 +507,7 @@ single_playbook() {
                 ansible-playbook -C "$FILE_PLAYBOOK" -l "$1"
             fi
         else
-            LIST_TAGS="$(echo $DIALOG_RET | sed 's/ /,/g')"
+            LIST_TAGS="$(echo $DIALOG_RET | $CMD_SED 's/ /,/g')"
             if [ -z "$2" ]; then
                 ansible-playbook "$FILE_PLAYBOOK" -l "$1" -t "$LIST_TAGS"
             else
@@ -521,7 +525,7 @@ single_playbook() {
 # return values:
 # none
 single_check() {
-    group_playbook "$1" 'check'
+    single_playbook "$1" 'check'
 }
 
 # remove inventory host
@@ -554,13 +558,19 @@ host_manage() {
     ITEMS_MANAGE+=('single_playbook' 'Run playbook for host')
     ITEMS_MANAGE+=('single_check' 'Test-run playbook for host')
     ITEMS_MANAGE+=('host_remove' 'Remove')
-
-    exec 3>&1
-    DIALOG_RET=$($DIALOG --clear --backtitle "$TITLE_MAIN $VERSION_MENU" --no-tags --cancel-label "Back" --ok-label "Ok" \
-        --menu "Manage host '$1'" 0 40 0 "${ITEMS_MANAGE[@]}" 2>&1 1>&3)
-    RET_CODE=$?
-    exec 3>&-
-    [ $RET_CODE = 0 ] && $DIALOG_RET "$1"
+    while true; do
+        exec 3>&1
+        DIALOG_RET=$($DIALOG --clear --backtitle "$TITLE_MAIN $VERSION_MENU" --no-tags --cancel-label "Back" --ok-label "Ok" \
+            --menu "Manage host '$1'" 0 40 0 "${ITEMS_MANAGE[@]}" 2>&1 1>&3)
+        RET_CODE=$?
+        exec 3>&-
+        if [ $RET_CODE = 0 ]; then
+            $DIALOG_RET "$1"
+            [ "$DIALOG_RET" = 'host_remove' ] && break
+        else
+            break
+        fi
+    done
 }
 
 # add new inventory host to Ansible inventory (and SSH config for production hosts)
@@ -828,6 +838,99 @@ functional_remove() {
     group_remove "$1" "$FILE_FUNCTIONAL"
 }
 
+# export custom Ansible directory for defined company as .tgz file
+# parameters:
+# $1 - group name
+# return values:
+# none
+company_export() {
+    $DIALOG --clear --title 'Export' --backtitle 'Manage group' --ok-label 'Export' --cancel-label 'Cancel' --yesno "Export custom Ansible directory for group '$1'?" 0 0
+	RET_CODE=$?
+
+    if [ "$RET_CODE" = 0 ]; then
+        COPY_FILE='site.yml ansible.cfg nam.sh'
+        COPY_DIR='roles scripts inventory'
+        DELETE_FILE='scripts/get_vault_pw.sh'
+        DELETE_DIR='roles/netcon.kali'
+
+        DEST_ANSIBLE="/tmp/ansible_$1"
+        DEST_ROLE="$DEST_ANSIBLE/roles"
+        DEST_INVENTORY="$DEST_ANSIBLE/inventory"
+        DEST_HOST="$DEST_INVENTORY/hosts"
+        DEST_GROUP="$DEST_INVENTORY/groups"
+        DEST_COMPANY="$DEST_INVENTORY/companies"
+
+        mkdir -p $DEST_ANSIBLE
+
+        for FILE_NAME in $COPY_FILE; do
+            cp $DIR_ANSIBLE/$FILE_NAME $DEST_ANSIBLE
+        done
+
+        for DIR_NAME in $COPY_DIR; do
+            cp -r $DIR_ANSIBLE/$DIR_NAME $DEST_ANSIBLE
+        done
+
+        for FILE_NAME in $DELETE_FILE; do
+            rm -f $DEST_ANSIBLE/$FILE_NAME
+        done
+
+        for DIR_NAME in $DELETE_DIR; do
+            rm -rf $DEST_ANSIBLE/$DIR_NAME
+        done
+
+        for FILE_NAME in $(ls $DEST_INVENTORY | grep -v 'hosts' | grep -v 'groups'); do
+            rm -f $DEST_INVENTORY/$FILE_NAME
+        done
+
+        $CMD_SED -i '/vault_password_file/d' $DEST_ANSIBLE/ansible.cfg
+
+        $CMD_SED -i '/^- hosts: kalium.ox.id/,/^\(-\|$\)/d' $DEST_ANSIBLE/site.yml
+        $CMD_SED -i 's/,!kalium.ox.id//' $DEST_ANSIBLE/site.yml
+
+        LIST_LINE="$(grep -n '^\[' $FILE_COMPANY | $CMD_AWK -F: '{print $1}')"
+        LINE_COUNT="$(echo $LIST_LINE | wc -w)"
+        for LINE_NUM in $(seq 1 $LINE_COUNT); do
+            LINE_START="$(echo $LIST_LINE | $CMD_AWK "{print $"$LINE_NUM"}")"
+            if $CMD_SED -n "${LINE_START}p" $FILE_COMPANY | grep -q "^\[$1"; then
+                LINE_END="$(expr $(echo $LIST_LINE | $CMD_AWK "{print $"$(expr $LINE_NUM + 1)"}") - 1)"
+                [ "$LINE_END" = '-1' ] && LINE_END="$(wc -l $FILE_COMPANY)"
+                $CMD_SED "$LINE_START,$LINE_END!d" $FILE_COMPANY >> $DEST_COMPANY
+            fi
+        done
+
+        $CMD_SED -i -n -E "/(^$1-|^\[[^:]+\]|^$)/p" $DEST_GROUP
+
+        LIST_LINE="$(grep -n '^\[' $FILE_FUNCTIONAL | $CMD_AWK -F: '{print $1}')"
+        LINE_COUNT="$(echo $LIST_LINE | wc -w)"
+        for LINE_NUM in $(seq 1 $LINE_COUNT); do
+            LINE_START="$(echo $LIST_LINE | $CMD_AWK "{print $"$LINE_NUM"}")"
+            if $CMD_SED -n "${LINE_START}p" $FILE_FUNCTIONAL | grep -q ':vars\]'; then
+                LINE_END="$(expr $(echo $LIST_LINE | $CMD_AWK "{print $"$(expr $LINE_NUM + 1)"}") - 1)"
+                [ "$LINE_END" = '-1' ] && LINE_END="$(wc -l $FILE_FUNCTIONAL)"
+                $CMD_SED "$LINE_START,$LINE_END!d" $FILE_FUNCTIONAL >> $DEST_GROUP
+            fi
+        done
+
+        $CMD_SED -i -n "/^$1-/p" $DEST_HOST
+
+        for DIR_NAME in $(ls $DEST_ROLE/netcon.postfix/files/label | grep -v "$1"); do
+            rm -rf $DEST_ROLE/netcon.postfix/files/label/$DIR_NAME
+        done
+
+        FILE_ARCHIVE="ansible_$1_$(date +%F).tgz"
+
+        tar --directory /tmp -czf "$FILE_ARCHIVE" ansible_$1
+        RET_CODE=$?
+        rm -rf $DEST_ANSIBLE
+
+        if [ "$RET_CODE" = 0 ] && [ -f "$FILE_ARCHIVE" ]; then
+            dialog --backtitle "Manage group" --title "Export successful" --clear --msgbox "Custom Ansible directory succesfully exported to archive '$FILE_ARCHIVE'" 0 0
+        else
+            dialog --backtitle "Manage group" --title "Export failed" --clear --msgbox "Export of custom Ansible directory has failed" 0 0
+        fi
+    fi
+}
+
 # remove company group
 # parameters:
 # $1 - group name
@@ -844,18 +947,25 @@ company_remove() {
 # return values:
 # none
 group_manage() {
-    exec 3>&1
-    DIALOG_RET=$($DIALOG --clear --backtitle "$TITLE_MAIN $VERSION_MENU" --no-tags \
-        --cancel-label "Back" --ok-label "Ok" --menu "Manage group '$1'" 0 40 0    \
-        "$2_hosts" "Manage hosts"                                                  \
-        "server_ping" "Ping"                                                       \
-        "single_playbook" "Run playbook for group"                                 \
-        "single_check" "Test-run playbook for group"                                \
-        "$2_remove" "Remove"                                                       \
-        2>&1 1>&3)
-    RET_CODE=$?
-    exec 3>&-
-    [ $RET_CODE = 0 ] && $DIALOG_RET "$1"
+    ITEMS_MANAGE=()
+    ITEMS_MANAGE+=("$2_hosts" 'Manage hosts')
+    ITEMS_MANAGE+=('server_ping' 'Ping')
+    ITEMS_MANAGE+=('single_playbook' 'Run playbook for group')
+    ITEMS_MANAGE+=('single_check' 'Test-run playbook for group')
+    [ "$2" = 'company' ] && ITEMS_MANAGE+=('company_export' 'Export')
+    ITEMS_MANAGE+=("$2_remove" 'Remove')
+    while true; do
+        exec 3>&1
+        DIALOG_RET=$($DIALOG --clear --backtitle "$TITLE_MAIN $VERSION_MENU" --no-tags --cancel-label "Back" --ok-label "Ok" --menu "Manage group '$1'" 0 40 0 "${ITEMS_MANAGE[@]}" 2>&1 1>&3)
+        RET_CODE=$?
+        exec 3>&-
+        if [ $RET_CODE = 0 ]; then
+            $DIALOG_RET "$1"
+            [ "$DIALOG_RET" = "$2_remove" ] && break
+        else
+            break
+        fi
+    done
 }
 
 # add new group to Ansible inventory
@@ -979,6 +1089,113 @@ company_menu() {
     group_menu 'company'
 }
 
+# create new Ansible vault
+# parameters:
+# none
+# return values:
+# none
+vault_new() {
+    if [ -f "$FILE_VAULT" ]; then
+        $DIALOG --clear --backtitle "$TITLE_MAIN $VERSION_MENU" --ok-label 'Ok' --cancel-label 'Cancel' --yesno 'Delete current vault and create new one?' 0 0
+        [ "$?" != 0 ] && return
+    fi
+    mkdir -p "$DIR_VAULT"
+    rm -f "$FILE_VAULT"
+    if [ -z "$FILE_PASSWORD" ]; then
+        clear
+        ansible-vault create "$FILE_VAULT"
+    else
+        while true; do
+            exec 3>&1
+            DIALOG_RET="$($DIALOG --clear --backtitle "$TITLE_MAIN $VERSION_MENU" --no-tags --inputbox "Enter vault password" 0 55 2>&1 1>&3)"
+            RET_CODE=$?
+            exec 3>&-
+            [ "$RET_CODE" != 0 ] && return
+            [ -z "$DIALOG_RET" ] || break
+        done
+        if [[ "$OSTYPE" =~ "darwin" ]]; then
+            security delete-generic-password -a vault_pw -s ansible &>/dev/null
+            security add-generic-password -a vault_pw -s ansible -w "$DIALOG_RET" &>/dev/null
+        else
+            echo "$DIALOG_RET" > "$HOME/vault_pw.txt"
+        fi
+        ansible-vault create "$FILE_VAULT" --new-vault-password-file "$FILE_PASSWORD"
+    fi
+}
+
+# edit Ansible vault
+# parameters:
+# none
+# return values:
+# none
+vault_edit() {
+    if [ -z "$FILE_PASSWORD" ]; then
+        clear
+        ansible-vault edit "$FILE_VAULT" 
+    else
+        ansible-vault edit "$FILE_VAULT" --vault-password-file "$FILE_PASSWORD"
+    fi
+}
+
+# change Ansible vault password
+# parameters:
+# none
+# return values:
+# none
+vault_password() {
+    if [ -z "$FILE_PASSWORD" ]; then
+        clear
+        ansible-vault rekey "$FILE_VAULT"
+    else
+        while true; do
+            exec 3>&1
+            DIALOG_RET="$($DIALOG --clear --backtitle "$TITLE_MAIN $VERSION_MENU" --no-tags --inputbox "Enter new vault password" 0 55 2>&1 1>&3)"
+            RET_CODE=$?
+            exec 3>&-
+            [ "$RET_CODE" != 0 ] && return
+            [ -z "$DIALOG_RET" ] || break
+        done
+        FILE_TMP='/tmp/TMPvaultpw'
+        if [ -x "$FILE_PASSWORD" ]; then
+            $FILE_PASSWORD > $FILE_TMP
+        else
+            cp $FILE_PASSWORD $FILE_TMP
+        fi
+        if [[ "$OSTYPE" =~ "darwin" ]]; then
+            security delete-generic-password -a vault_pw -s ansible &>/dev/null
+            security add-generic-password -a vault_pw -s ansible -w "$DIALOG_RET" &>/dev/null
+        else
+            echo "$DIALOG_RET" > "$HOME/vault_pw.txt"
+        fi
+        ansible-vault rekey "$FILE_VAULT" --vault-password-file "$FILE_TMP" --new-vault-password-file "$FILE_PASSWORD" &>/dev/null
+        rm -f $FILE_TMP
+    fi
+}
+
+# manage Ansible vault in dialog menu
+# parameters:
+# none
+# return values:
+# none
+vault_manage() {
+    while true; do
+        ITEMS_MANAGE=()
+        ITEMS_MANAGE+=('vault_new' 'Create new')
+        [ -f "$FILE_VAULT" ] && ITEMS_MANAGE+=('vault_edit' 'Edit')
+        [ -f "$FILE_VAULT" ] && ITEMS_MANAGE+=('vault_password' 'Change password')
+
+        exec 3>&1
+        DIALOG_RET=$($DIALOG --clear --backtitle "$TITLE_MAIN $VERSION_MENU" --no-tags --cancel-label "Back" --ok-label "Ok" --menu 'Manage vault' 0 40 0 "${ITEMS_MANAGE[@]}" 2>&1 1>&3)
+        RET_CODE=$?
+        exec 3>&-
+        if [ $RET_CODE = 0 ]; then
+            $DIALOG_RET
+        else
+            break
+        fi
+    done
+}
+
 # define filter and run Ansible playbook for filtered list of hosts
 # parameters:
 # $1 - if empty run playbook, else test-run only
@@ -1094,12 +1311,18 @@ playbook_manage() {
 	ARRAY+=('playbook_check' 'Test-run')
 	ARRAY+=('playbook_syntax' 'Check syntax')
 	ARRAY+=('playbook_edit' 'Edit')
-    exec 3>&1
-    DIALOG_RET=$($DIALOG --clear --title 'Manage Ansible playbook' --backtitle 'Ansible playbooks' --no-tags        \
-        --ok-label 'Select' --cancel-label 'Back' --menu '' 0 0 0 "${ARRAY[@]}" 2>&1 1>&3)
-    RET_CODE=$?
-    exec 3>&-
-    [ $RET_CODE = 0 ] && $DIALOG_RET
+    while true; do
+        exec 3>&1
+        DIALOG_RET=$($DIALOG --clear --title 'Manage Ansible playbook' --backtitle 'Ansible playbooks' --no-tags        \
+            --ok-label 'Select' --cancel-label 'Back' --menu '' 0 0 0 "${ARRAY[@]}" 2>&1 1>&3)
+        RET_CODE=$?
+        exec 3>&-
+        if [ $RET_CODE = 0 ]; then
+            $DIALOG_RET
+        else
+            break
+        fi
+    done
 }
 
 # edit role sections
@@ -1124,11 +1347,17 @@ role_manage() {
     ARRAY+=('vars' 'vars')
     ARRAY+=('templates' 'templates')
     ARRAY+=('files' 'files')
-    exec 3>&1
-    DIALOG_RET=$($DIALOG --clear --title 'Manage role' --backtitle 'Ansible roles' --no-tags --ok-label 'Select' --cancel-label 'Back' --menu '' 0 0 0 "${ARRAY[@]}" 2>&1 1>&3)
-    RET_CODE=$?
-    exec 3>&-
-    [ $RET_CODE = 0 ] && role_edit "$DIALOG_RET" "$1"
+    while true; do
+        exec 3>&1
+        DIALOG_RET=$($DIALOG --clear --title 'Manage role' --backtitle 'Ansible roles' --no-tags --ok-label 'Select' --cancel-label 'Back' --menu '' 0 0 0 "${ARRAY[@]}" 2>&1 1>&3)
+        RET_CODE=$?
+        exec 3>&-
+        if [ $RET_CODE = 0 ]; then
+            role_edit "$DIALOG_RET" "$1"
+        else
+            break
+        fi
+    done
 }
 
 # get parameters for new role from user and add it
@@ -1200,6 +1429,7 @@ ITEMS_MAIN+=('host_menu' 'Hosts')
 ITEMS_MAIN+=('functional_menu' 'Functional groups')
 [ -f "$FILE_COMPANY" ] && ITEMS_MAIN+=('company_menu' 'Company groups')
 ITEMS_MAIN+=('role_menu' 'Roles')
+ITEMS_MAIN+=('vault_manage' 'Vault')
 ITEMS_MAIN+=('playbook_manage' "site.yml")
 ITEMS_MAIN+=('edit_config' 'ansible.cfg')
 while true; do
